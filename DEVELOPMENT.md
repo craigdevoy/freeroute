@@ -65,7 +65,7 @@ Interactive check with the MCP inspector:
 Config notes:
 
 - `prefer` and `avoid` match as case-insensitive substrings of the model id. Free model names change often, so check `list_free_models` before relying on a `prefer` entry. A prefer list that matches nothing silently falls back to ranking by context size, then newest.
-- `budget_seconds` is clamped to 5-110, default 75. Keep it under the MCP client's tool timeout.
+- `budget_seconds` is the ceiling for one call: clamped to 10-900, default 300. The budget actually used is the smaller of that and `30 + max_tokens / 25` seconds (at least 60). Set it to 50 for clients that time out at 60 seconds. Claude Code's tool timeout is long by default. Claude Desktop's is unverified and may be 60 seconds.
 - `default_route` is `"router"` (default) or `"ranked"`. Any other value is rejected at startup. `prefer` and `avoid` apply to ranked and fallback models. For router answers, `avoid` is enforced after the fact: a served model on the avoid list is discarded and the next step is tried.
 
 ## Deploy to a new machine
@@ -108,11 +108,22 @@ Request path in `ask`:
 2. Reject input over 300,000 bytes, or containing the key or a key-shaped prefix.
 3. Load the model catalog (cached one hour, `ensure_catalog`). A model is free only if the id ends in `:free` and every price field is zero.
 4. Build the chain: an explicit `model` alone (must be in the free list), or by default `openrouter/free` then the top 2 from `rank`. Ranked-first (top 3, then the router) when `default_route` is `"ranked"` or the input needs over 32k tokens of context. Return early if no free model has enough context.
-5. For each step, `acquire` a rate-limit slot (18 per minute), then `chat`. The deadline starts before the catalog fetch. A router attempt leaves 15 s for fallbacks and is capped at 45 s. A ranked attempt is capped at 40 s.
+5. For each step, `acquire` a rate-limit slot (18 per minute), then `chat`. The deadline starts before the catalog fetch. No attempt starts with under 10 s left. Before the first output an attempt keeps 15 s back for fallbacks and waits at most 60 s. Once output flows it may use all the remaining budget.
+
+`chat` streams (`stream: true`, with `stream_options.include_usage` so cost still arrives in the last chunk) through a second ureq agent that has connect (10 s) and read (30 s) timeouts but no overall timeout, because in ureq 2 an overall `.timeout()` overrides the idle timeout. The limits are checked in the read loop:
+
+- Socket read, 30 s: any byte resets it, including `: OPENROUTER PROCESSING` keepalives. This catches dead connections only.
+- Stall clock: only a data event with non-empty `delta.content`, `delta.reasoning` or `delta.reasoning_content` resets it. 60 s before the first one, 30 s between.
+- Hard deadline: the call budget.
+- The first chunk's `model` is checked immediately. A non-`:free` id disables the server before any output is kept.
+- A mid-stream `error` object, or `finish_reason: "error"`, counts as a dead stream.
+- A stream that finished but stalled before `[DONE]` still counts as complete.
+- Progress: with `params._meta.progressToken`, `notifications/progress` is written from the read loop at the first output and then at most every 5 s. `progress` is the cumulative characters received. `notifications/cancelled` is not read during a call.
 6. `Outcome` decides what happens next:
    - `Ok`: wrap and return.
    - `Daily`: stop, quota gone.
    - `Stop`: stop, no other model can help (401, 402, other 403, 413, cost tripwire, reply cut off with no answer).
+   - `Partial`: the stream died after some output. The longest partial is kept. A fallback only starts if the budget covers `10 + max_tokens / 50` seconds. If nothing better arrives, the partial is returned flagged, never as an error and never joined with another model's text.
    - `Skip`: park the model for a while and try the next one. A 429 or a 403 "region / not available" also gives the router one more try (`again`). A region 403 parks a ranked model for 24 hours.
 7. `finish` checks the served id exactly (no `:free` stripping): no `:free` suffix sets `killed` and writes the kill file; a `:free` id outside the live list is discarded after one catalog refresh; an echoed `openrouter/free` alias is allowed with a `served_model_unverified` note. Then it sanitises the text (control, bidi and zero-width characters removed, 256 KB cap), wraps it with a random nonce, and adds a metadata line.
 
@@ -127,7 +138,7 @@ Invariants to keep when editing:
 ## Known gaps
 
 - Not yet verified against the live API: whether `openrouter/free` can route to a paid model, and the Claude Desktop tool timeout for long answers. The response `model` field kept its `:free` suffix in two router calls. Use a key with a $0 credit limit, and watch OpenRouter activity after first use.
-- The `usage.cost` tripwire only works if OpenRouter returns usage cost without being asked. The request does not send `usage:{include:true}` or a `max_price`.
+- The `usage.cost` tripwire reads the final usage chunk. The request sets `stream_options.include_usage`, but whether OpenRouter includes `cost` for free calls in that chunk is not verified, and an interrupted stream never sends it. The request sends no `max_price`.
 - The router cannot be told to pick a model with enough context, so large inputs go ranked-first.
 - After a 404 the catalog is marked stale and refetched on the next call, and again on each later call if the refetch fails with no catalog, which could add a request per call on a flaky network.
 - The key-shape check covers five prefixes only. Claude must strip secrets and personal data before calling. The server does not scan for them.

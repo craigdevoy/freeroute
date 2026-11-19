@@ -1,5 +1,5 @@
 {
   "prefer": ["deepseek", "qwen", "llama", "gemma"],
   "avoid": [],
-  "budget_seconds": 45
+  "budget_seconds": 300
 }

@@ -23,7 +23,19 @@ const RATE_PER_MIN: usize = 18;
 const CATALOG_TTL: Duration = Duration::from_secs(3600);
 const CATALOG_CAP: usize = 200;
 const MAX_LIST_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_CHAT_BYTES: u64 = 2 * 1024 * 1024;
+/// Raw bytes read from one stream. SSE framing makes this much larger than the text itself.
+const MAX_STREAM_BYTES: u64 = 16 * 1024 * 1024;
+/// No content or reasoning for this long after output has started ends the attempt.
+const IDLE_LIMIT: Duration = Duration::from_secs(30);
+/// No content or reasoning for this long at the start ends the attempt. Keepalives do not count.
+const FIRST_DATA_LIMIT: Duration = Duration::from_secs(60);
+/// Time held back for fallbacks until the first output arrives.
+const FALLBACK_RESERVE: Duration = Duration::from_secs(15);
+/// No attempt starts with less time than this left.
+const MIN_START: Duration = Duration::from_secs(10);
+const PROGRESS_EVERY: Duration = Duration::from_secs(5);
+/// Conservative speed of a free model, used to size the budget: 30 s + max_tokens / 25.
+const TOKENS_PER_SEC_ASSUMED: u64 = 25;
 const CHAIN_LEN: usize = 3;
 /// Ranked models tried after the router when it is the default route.
 const FALLBACK_LEN: usize = 2;
@@ -42,7 +54,9 @@ struct Config {
     prefer: Vec<String>,
     /// Substrings of model ids to never use.
     avoid: Vec<String>,
-    /// Total wall-clock budget for one tool call, in seconds. Default 75.
+    /// Ceiling for one tool call, in seconds. Default 300, range 10 to 900. The budget used is
+    /// the smaller of this and 30 s + max_tokens / 25 (at least 60 s). Use 50 for clients that
+    /// give up after 60 s.
     budget_seconds: Option<u64>,
     /// "router" (default): try openrouter/free first. "ranked": try ranked free models first.
     default_route: Option<String>,
@@ -219,6 +233,8 @@ struct Ask {
     system: Option<String>,
     max_tokens: u64,
     model: Option<String>,
+    /// The client's progress token, when it sent one.
+    progress: Option<Value>,
 }
 
 struct Success {
@@ -227,12 +243,16 @@ struct Success {
     finish: String,
     tokens_in: u64,
     tokens_out: u64,
+    /// Extra metadata words, such as a truncation warning. Empty for a normal answer.
+    note: String,
 }
 
 enum Outcome {
     Ok(Success),
     /// Daily free quota is used up. Stop the chain.
     Daily(String),
+    /// The stream died after some output. Kept as a fallback answer if nothing better arrives.
+    Partial { s: Success, reason: String },
     /// A problem that no other model can fix. Stop the chain.
     Stop(String),
     /// A problem with this model. Park it and try the next one.
@@ -244,6 +264,8 @@ enum Outcome {
 
 struct State {
     agent: ureq::Agent,
+    /// For streamed chats: connect and idle read timeouts only, no overall timeout.
+    stream_agent: ureq::Agent,
     key: Result<String, String>,
     cfg: Config,
     fatal: Option<String>,
@@ -273,6 +295,12 @@ impl State {
         State {
             agent: ureq::AgentBuilder::new()
                 .timeout_connect(Duration::from_secs(10))
+                .max_idle_connections(2)
+                .user_agent("freeroute")
+                .build(),
+            stream_agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(10))
+                .timeout_read(Duration::from_secs(30))
                 .max_idle_connections(2)
                 .user_agent("freeroute")
                 .build(),
@@ -354,7 +382,21 @@ impl State {
         format!("{:016x}", h.finish())
     }
 
-    fn chat(&mut self, id: &str, a: &Ask, per_attempt: Duration) -> Outcome {
+    /// Stop all calls until restart. Also writes the kill file, so the stop survives one.
+    fn disable(&mut self, why: &str) {
+        self.killed = true;
+        if let Some(f) = &self.kill_file {
+            let _ = std::fs::write(f, format!("{why}\n"));
+        }
+    }
+
+    /// One streamed attempt against one model.
+    ///
+    /// Three clocks guard it. The socket read timeout (30 s) catches a dead connection, and any
+    /// byte resets it, keepalive comments included. The stall clock only resets on a data event
+    /// that carries content or reasoning: `first_wait` before the first one, `IDLE_LIMIT` after.
+    /// `hard_deadline` ends the attempt whatever else happens.
+    fn chat(&mut self, id: &str, a: &Ask, first_wait: Duration, hard_deadline: Instant) -> Outcome {
         let key = match &self.key {
             Ok(k) => k.clone(),
             Err(e) => return Outcome::Stop(e.clone()),
@@ -366,14 +408,22 @@ impl State {
             messages.push(json!({"role": "system", "content": s}));
         }
         messages.push(json!({"role": "user", "content": a.prompt}));
-        let body = json!({"model": id, "messages": messages, "max_tokens": a.max_tokens});
+        let body = json!({
+            "model": id,
+            "messages": messages,
+            "max_tokens": a.max_tokens,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        });
 
+        // No overall .timeout() here: in ureq 2 it would override the idle timeout.
+        // The deadlines are checked in the read loop below.
         let result = self
-            .agent
+            .stream_agent
             .post(&format!("{API}/chat/completions"))
             .set("Authorization", &format!("Bearer {key}"))
             .set("X-Title", "freeroute")
-            .timeout(per_attempt)
+            .set("Accept", "text/event-stream")
             .send_json(body);
 
         let resp = match result {
@@ -407,58 +457,179 @@ impl State {
             Err(e) => return skip(&format!("network or timeout: {e}"), 180, false),
         };
 
-        let reader = BufReader::new(resp.into_reader().take(MAX_CHAT_BYTES));
-        let v: Value = match serde_json::from_reader(reader) {
-            Ok(v) => v,
-            Err(e) => return skip(&format!("unreadable reply: {e}"), 180, false),
-        };
-        if let Some(e) = v.get("error") {
-            return skip(&format!("error in reply: {}", short(&e.to_string())), 180, false);
-        }
+        let mut reader = BufReader::new(resp.into_reader().take(MAX_STREAM_BYTES));
+        let started = Instant::now();
+        let mut line = String::new();
+        let mut text = String::new();
+        let mut served = id.to_string();
+        let mut seen_model = false;
+        let mut finish: Option<String> = None;
+        let mut tokens_in = 0u64;
+        let mut tokens_out = 0u64;
+        let mut reasoning_chars = 0usize;
+        let mut last_data: Option<Instant> = None;
+        let mut last_progress = started;
+        let mut last_sent = 0usize;
+        let mut died: Option<String> = None;
 
-        // Tripwire: a free call must never report a cost.
-        if let Some(cost) = v.pointer("/usage/cost").and_then(Value::as_f64) {
-            if cost > 0.0 {
-                self.killed = true;
-                return Outcome::Stop(format!(
-                    "STOPPED: a call reported a cost of {cost}. freeroute is now disabled until it restarts. Check your OpenRouter activity."
-                ));
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    died = Some(format!("stream read failed: {e}"));
+                    break;
+                }
+            }
+            let now = Instant::now();
+
+            if let Some(payload) = line.trim().strip_prefix("data:") {
+                let p = payload.trim();
+                if p == "[DONE]" {
+                    break;
+                }
+                // Lines that are not valid JSON are ignored. Comments (": ...") never reach here.
+                if let Ok(v) = serde_json::from_str::<Value>(p) {
+                    if let Some(e) = v.get("error") {
+                        died = Some(format!("error in stream: {}", short(&e.to_string())));
+                        break;
+                    }
+                    if !seen_model {
+                        if let Some(m) = v.get("model").and_then(Value::as_str) {
+                            seen_model = true;
+                            served = m.to_string();
+                            // Check at the first chunk, before any output is collected.
+                            if served != FREE_ROUTER && !served.ends_with(":free") {
+                                let msg = format!(
+                                    "STOPPED: the reply is coming from {served}, which is not a :free model. freeroute is now disabled until it restarts. Check your OpenRouter activity."
+                                );
+                                self.disable("served a model without the :free suffix");
+                                return Outcome::Stop(msg);
+                            }
+                        }
+                    }
+                    if let Some(u) = v.get("usage") {
+                        tokens_in = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(tokens_in);
+                        tokens_out =
+                            u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(tokens_out);
+                        // Tripwire: a free call must never report a cost.
+                        if let Some(cost) = u.get("cost").and_then(Value::as_f64) {
+                            if cost > 0.0 {
+                                self.disable("a call reported a cost");
+                                return Outcome::Stop(format!(
+                                    "STOPPED: a call reported a cost of {cost}. freeroute is now disabled until it restarts. Check your OpenRouter activity."
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(ch) = v.pointer("/choices/0") {
+                        if let Some(c) = ch.pointer("/delta/content").and_then(Value::as_str) {
+                            if !c.is_empty() {
+                                text.push_str(c);
+                                last_data = Some(now);
+                            }
+                        }
+                        for k in ["/delta/reasoning", "/delta/reasoning_content"] {
+                            if let Some(r) = ch.pointer(k).and_then(Value::as_str) {
+                                if !r.is_empty() {
+                                    reasoning_chars += r.len();
+                                    last_data = Some(now);
+                                }
+                            }
+                        }
+                        if let Some(f) = ch.get("finish_reason").and_then(Value::as_str) {
+                            finish = Some(f.to_string());
+                            if f == "error" {
+                                died = Some("the provider ended the stream with an error".to_string());
+                                break;
+                            }
+                        }
+                    }
+                    if text.len() > MAX_OUTPUT_BYTES {
+                        finish = Some("length".to_string());
+                        break;
+                    }
+                }
+            }
+
+            // Progress for clients that sent a progress token. Best effort, at most every 5 s.
+            if let Some(tok) = &a.progress {
+                let total = text.len() + reasoning_chars;
+                if total > last_sent
+                    && (last_sent == 0 || now.duration_since(last_progress) >= PROGRESS_EVERY)
+                {
+                    send_progress(tok, total as u64, "receiving");
+                    last_sent = total;
+                    last_progress = now;
+                }
+            }
+
+            if now >= hard_deadline {
+                died = Some("time budget used".to_string());
+                break;
+            }
+            let (since, limit, what) = match last_data {
+                None => (now.duration_since(started), first_wait, "no output before the first-data limit"),
+                Some(t) => (now.duration_since(t), IDLE_LIMIT, "the stream went quiet"),
+            };
+            if since > limit {
+                died = Some(what.to_string());
+                break;
             }
         }
 
-        let msg = v.pointer("/choices/0/message");
-        let content = msg
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        // A stream that finished and then stalled before the usage chunk is still complete.
+        if died.is_some() && matches!(finish.as_deref(), Some(f) if f != "error") {
+            died = None;
+        }
+
+        let content = text.trim().to_string();
         if content.is_empty() {
-            let cut = v.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length");
-            return if cut {
+            if finish.as_deref() == Some("length") {
                 // Reasoning models spend max_tokens on thinking. Other models would do the same
                 // with this request, so stop instead of burning quota down the chain.
-                Outcome::Stop(
-                    "the model used all max_tokens on reasoning and gave no answer. Raise max_tokens (try 1500 or more)."
-                        .to_string(),
-                )
-            } else {
-                skip("empty answer", 180, false)
-            };
+                let advice = if a.max_tokens < 4000 {
+                    "Raise max_tokens (try 4000 or more)."
+                } else {
+                    "Try a simpler prompt, or name a different model."
+                };
+                return Outcome::Stop(format!(
+                    "{served} used all {} tokens on reasoning and gave no answer. {advice}",
+                    a.max_tokens
+                ));
+            }
+            return skip(&died.unwrap_or_else(|| "empty answer".to_string()), 180, false);
         }
-        let text = content;
 
-        Outcome::Ok(Success {
-            text,
-            served: v.get("model").and_then(Value::as_str).unwrap_or(id).to_string(),
-            finish: v
-                .pointer("/choices/0/finish_reason")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
-            tokens_in: v.pointer("/usage/prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
-            tokens_out: v.pointer("/usage/completion_tokens").and_then(Value::as_u64).unwrap_or(0),
-        })
+        match died {
+            None => Outcome::Ok(Success {
+                text: content,
+                served,
+                finish: finish.unwrap_or_else(|| "unknown".to_string()),
+                tokens_in,
+                tokens_out,
+                note: String::new(),
+            }),
+            Some(reason) => {
+                let marker = format!(
+                    "\n[INCOMPLETE: the stream ended after {} characters: {}]",
+                    content.len(),
+                    reason
+                );
+                Outcome::Partial {
+                    s: Success {
+                        text: format!("{content}{marker}"),
+                        served,
+                        finish: "stream_interrupted".to_string(),
+                        tokens_in,
+                        tokens_out,
+                        note: format!("WARNING=truncated NOTE=cost_unverified reason=\"{reason}\""),
+                    },
+                    reason,
+                }
+            }
+        }
     }
 
     /// Returns (wrapped answer, metadata line) or an error message.
@@ -489,8 +660,11 @@ impl State {
             }
         }
 
-        // The budget starts here so a slow catalog fetch counts against it.
-        let budget = self.cfg.budget_seconds.unwrap_or(75).clamp(5, 110);
+        // The budget grows with max_tokens: long answers need long streams. budget_seconds is
+        // the ceiling. The clock starts here so a slow catalog fetch counts against it.
+        let ceiling = self.cfg.budget_seconds.unwrap_or(300).clamp(10, 900);
+        let scaled = (30 + a.max_tokens / TOKENS_PER_SEC_ASSUMED).clamp(60, 900);
+        let budget = ceiling.min(scaled);
         let deadline = Instant::now() + Duration::from_secs(budget);
 
         self.ensure_catalog()?;
@@ -530,6 +704,8 @@ impl State {
         let mut failures: Vec<String> = Vec::new();
         let mut attempts = 0;
         let mut router_retried = false;
+        // The longest partial answer so far. Output from two models is never joined.
+        let mut best: Option<(String, Success)> = None;
 
         while let Some(id) = chain.pop_front() {
             if !self.acquire(deadline) {
@@ -537,28 +713,38 @@ impl State {
                 break;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining < Duration::from_secs(3) {
+            if remaining < MIN_START {
                 failures.push("time budget used".to_string());
                 break;
             }
-            // Keep time for the fallbacks when the router is slow.
-            let cap = if id == FREE_ROUTER && !chain.is_empty() {
-                remaining
-                    .saturating_sub(Duration::from_secs(15))
-                    .clamp(Duration::from_secs(3), Duration::from_secs(45))
-            } else if id == FREE_ROUTER {
-                remaining.min(Duration::from_secs(45))
-            } else {
-                remaining.min(Duration::from_secs(40))
-            };
+            // Before the first output, keep time back for the fallbacks. Once output flows,
+            // the stream may use everything that is left.
+            let reserve = if chain.is_empty() { Duration::ZERO } else { FALLBACK_RESERVE };
+            let first_wait = remaining
+                .saturating_sub(reserve)
+                .clamp(Duration::from_secs(5), FIRST_DATA_LIMIT);
             attempts += 1;
-            match self.chat(&id, &a, cap) {
+            match self.chat(&id, &a, first_wait, deadline) {
                 Outcome::Ok(s) => {
                     if is_avoided(&self.cfg, &s.served) {
                         failures.push(format!("{id}: served {} which is on your avoid list", s.served));
                         continue;
                     }
                     return self.finish(&id, attempts, &failures, s);
+                }
+                Outcome::Partial { s, reason } => {
+                    failures.push(format!("{id}: {reason}"));
+                    if id != FREE_ROUTER {
+                        self.parked.insert(id.clone(), Instant::now() + Duration::from_secs(180));
+                    }
+                    if best.as_ref().map(|(_, b)| b.text.len()).unwrap_or(0) < s.text.len() {
+                        best = Some((id.clone(), s));
+                    }
+                    // A fallback only starts if the budget could cover a full answer.
+                    let need = Duration::from_secs(10 + a.max_tokens / 50);
+                    if deadline.saturating_duration_since(Instant::now()) < need {
+                        break;
+                    }
                 }
                 Outcome::Daily(m) => {
                     return Err(format!(
@@ -582,6 +768,9 @@ impl State {
                 }
             }
         }
+        if let Some((id, s)) = best {
+            return self.finish(&id, attempts, &failures, s);
+        }
         Err(format!("All attempts failed. {}", failures.join("; ")))
     }
 
@@ -599,10 +788,7 @@ impl State {
             // The provider echoed the alias, so the real model is unknown.
             unverified = true;
         } else if !s.served.ends_with(":free") {
-            self.killed = true;
-            if let Some(f) = &self.kill_file {
-                let _ = std::fs::write(f, "served a model without the :free suffix\n");
-            }
+            self.disable("served a model without the :free suffix");
             return Err(format!(
                 "STOPPED: the reply came from {}, which is not a :free model. freeroute is now disabled until it restarts. Check your OpenRouter activity.",
                 s.served
@@ -633,6 +819,10 @@ impl State {
         }
         if unverified {
             meta.push_str(" NOTE=served_model_unverified");
+        }
+        if !s.note.is_empty() {
+            meta.push(' ');
+            meta.push_str(&s.note);
         }
         if !failures.is_empty() {
             meta.push_str(&format!(" failed=[{}]", failures.join("; ")));
@@ -701,6 +891,7 @@ impl State {
                         .and_then(Value::as_str)
                         .filter(|s| !s.trim().is_empty())
                         .map(str::to_string),
+                    progress: params.pointer("/_meta/progressToken").cloned(),
                 };
                 match self.ask(a) {
                     Ok((text, meta)) => rpc_ok(
@@ -762,6 +953,20 @@ fn skip_again(reason: &str, park_secs: u64) -> Outcome {
         stale: false,
         again: true,
     }
+}
+
+/// MCP progress notification. Written from the read loop, which is the only thread that writes
+/// to stdout, so lines never interleave. Clients that sent no token never get one.
+fn send_progress(token: &Value, progress: u64, message: &str) {
+    let m = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {"progressToken": token, "progress": progress, "message": message}
+    });
+    let out = std::io::stdout();
+    let mut out = out.lock();
+    let _ = writeln!(out, "{m}");
+    let _ = out.flush();
 }
 
 fn is_avoided(cfg: &Config, id: &str) -> bool {
